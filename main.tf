@@ -11,7 +11,7 @@ terraform {
     }
   }
   backend "gcs" {
-    bucket = "REPLACE_WITH_YOUR_TFSTATE_BUCKET"
+    bucket = "REPLACE_WITH_YOUR_TFSTATE_BUCKET"   # replace with your bucket name
     prefix = "after"
   }
 }
@@ -28,7 +28,7 @@ provider "google-beta" {
 
 # -------------------------------------------------------
 # VPC — private cluster needs its own network
-# FIX: private nodes, no public IPs on cluster nodes
+# FIX: private nodes, no public IPs on cluster machines
 # -------------------------------------------------------
 resource "google_compute_network" "vpc" {
   name                    = "${var.cluster_name}-vpc"
@@ -40,7 +40,7 @@ resource "google_compute_subnetwork" "subnet" {
   ip_cidr_range            = "10.0.0.0/20"
   region                   = var.region
   network                  = google_compute_network.vpc.id
-  private_ip_google_access = true   # nodes reach GCP APIs without public IPs
+  private_ip_google_access = true
 
   secondary_ip_range {
     range_name    = "pods"
@@ -52,7 +52,7 @@ resource "google_compute_subnetwork" "subnet" {
   }
 }
 
-# Cloud NAT — lets private nodes pull images without public IPs
+# Cloud NAT — lets private nodes reach internet (pull images) without public IPs
 resource "google_compute_router" "router" {
   name    = "${var.cluster_name}-router"
   region  = var.region
@@ -96,25 +96,25 @@ resource "google_project_iam_member" "node_sa_metrics_writer" {
 
 # -------------------------------------------------------
 # GKE Cluster
-# FIX: regional (HA), private nodes, HPA enabled,
-#      managed prometheus, VPA, cost allocation tracking
+# FIX: regional (HA), private, HPA on, managed prometheus,
+#      VPA, cost allocation, maintenance window
 # -------------------------------------------------------
 resource "google_container_cluster" "primary" {
   provider = google-beta
 
   name                = var.cluster_name
-  location            = var.region   # FIX: regional — was zonal
+  location            = var.region          # FIX: regional — was zonal
   deletion_protection = false
 
-  # VPC-native networking (alias IPs) — required for private cluster
   network    = google_compute_network.vpc.id
   subnetwork = google_compute_subnetwork.subnet.id
+
   ip_allocation_policy {
     cluster_secondary_range_name  = "pods"
     services_secondary_range_name = "services"
   }
 
-  # FIX: private nodes — no public IPs on cluster machines
+  # FIX: private nodes — no public IPs
   private_cluster_config {
     enable_private_nodes    = true
     enable_private_endpoint = false
@@ -128,11 +128,10 @@ resource "google_container_cluster" "primary" {
     }
   }
 
-  # FIX: remove default node pool immediately — no wasted node
+  # FIX: remove wasteful default node pool
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  # FIX: Workload Identity — pods authenticate as GCP SAs, not node SA
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
@@ -154,7 +153,7 @@ resource "google_container_cluster" "primary" {
     enabled = true
   }
 
-  # FIX: GCP Managed Prometheus — replaces self-hosted Prometheus pods
+  # FIX: GCP Managed Prometheus — replaces self-hosted Prometheus
   monitoring_config {
     enable_components = ["SYSTEM_COMPONENTS", "POD", "DAEMONSET", "DEPLOYMENT"]
     managed_prometheus {
@@ -166,18 +165,18 @@ resource "google_container_cluster" "primary" {
     enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
   }
 
-  # FIX: cost allocation per namespace visible in Cloud Billing
+  # FIX: cost allocation per namespace in Cloud Billing
   cost_management_config {
     enabled = true
   }
 
-  # FIX: bin-pack aggressively instead of spreading (saves nodes)
+  # FIX: bin-pack nodes instead of spreading (saves nodes)
   cluster_autoscaling {
-    enabled             = false   # NAP off — we manage pools explicitly
+    enabled             = false
     autoscaling_profile = "OPTIMIZE_UTILIZATION"
   }
 
-  # FIX: maintenance during low-traffic hours
+  # FIX: updates during low-traffic window
   maintenance_policy {
     recurring_window {
       start_time = "2024-01-01T02:00:00Z"
@@ -196,8 +195,8 @@ resource "google_container_cluster" "primary" {
 }
 
 # -------------------------------------------------------
-# Node Pool: spot — for stateless workloads
-# FIX: e2-standard-4 spot VMs, autoscales 1-4 per zone
+# Node Pool: spot — stateless workloads
+# FIX: e2-standard-4 spot, autoscales per zone
 #      was: n1-standard-8 on-demand, static 5 nodes
 # -------------------------------------------------------
 resource "google_container_node_pool" "spot_workload" {
@@ -205,9 +204,8 @@ resource "google_container_node_pool" "spot_workload" {
   location = var.region
   cluster  = google_container_cluster.primary.name
 
-  # FIX: autoscaler — min=1 max=4 per zone (3 zones = 3–12 nodes total)
   autoscaling {
-    min_node_count  = var.spot_min_nodes
+    min_node_count  = var.spot_min_nodes   # FIX: autoscales (was static 5)
     max_node_count  = var.spot_max_nodes
     location_policy = "BALANCED"
   }
@@ -217,23 +215,17 @@ resource "google_container_node_pool" "spot_workload" {
     auto_upgrade = true
   }
 
-  upgrade_settings {
-    max_surge       = 1
-    max_unavailable = 0
-  }
-
   node_config {
     machine_type    = "e2-standard-4"                          # FIX: right-sized (was n1-standard-8)
-    spot            = true                                     # FIX: 60-91% cheaper (was on-demand)
-    disk_size_gb    = 50                                       # FIX: was 200GB
-    disk_type       = "pd-balanced"                            # FIX: was pd-ssd (unnecessary)
+    spot            = true                                     # FIX: 60-91% cheaper
+    disk_size_gb    = 50                                       # FIX: was 200 GB
+    disk_type       = "pd-balanced"                            # FIX: was pd-ssd
     service_account = google_service_account.gke_node_sa.email # FIX: least-privilege SA
 
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
 
-    # Taint — only workloads that explicitly tolerate spot land here
     taint {
       key    = "cloud.google.com/gke-spot"
       value  = "true"
@@ -241,9 +233,8 @@ resource "google_container_node_pool" "spot_workload" {
     }
 
     labels = {
-      env        = var.environment
-      pool       = "spot"
-      managed-by = "terraform"
+      env  = var.environment
+      pool = "spot"
     }
 
     oauth_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -257,8 +248,7 @@ resource "google_container_node_pool" "spot_workload" {
 }
 
 # -------------------------------------------------------
-# Node Pool: on-demand — critical / stateful only
-# Small, stable pool for ingress controller etc.
+# Node Pool: on-demand — ingress controller + critical only
 # -------------------------------------------------------
 resource "google_container_node_pool" "ondemand_critical" {
   name     = "ondemand-critical-pool"
@@ -288,9 +278,8 @@ resource "google_container_node_pool" "ondemand_critical" {
     }
 
     labels = {
-      env        = var.environment
-      pool       = "ondemand-critical"
-      managed-by = "terraform"
+      env  = var.environment
+      pool = "ondemand-critical"
     }
 
     oauth_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -305,7 +294,7 @@ resource "google_container_node_pool" "ondemand_critical" {
 
 # -------------------------------------------------------
 # Static IP — one for the ingress controller
-# FIX: was 3 reserved IPs (2 unused). Now just 1.
+# FIX: was 3 reserved (2 unused). Now 1.
 # -------------------------------------------------------
 resource "google_compute_address" "ingress_ip" {
   name   = "${var.cluster_name}-ingress-ip"

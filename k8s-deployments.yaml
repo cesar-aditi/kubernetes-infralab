@@ -1,16 +1,9 @@
-# Apply order:
-#   1. kubectl apply -f k8s-deployments.yaml
-#   2. kubectl apply -f k8s-ingress.yaml (after installing nginx ingress controller)
-#
-# Install ingress controller first:
-#   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-#   helm install ingress-nginx ingress-nginx/ingress-nginx \
-#     --namespace ingress-nginx --create-namespace \
-#     --set controller.service.loadBalancerIP=$(terraform output -raw ingress_ip)
+# kubectl apply -f k8s-deployments.yaml
+# (02-deploy-after.sh does this automatically)
 
 # -------------------------------------------------------
-# Namespace + ResourceQuota
-# FIX: was missing entirely — no limits on what teams could deploy
+# Namespace + guardrails
+# FIX: was missing — no limits on what could be deployed
 # -------------------------------------------------------
 apiVersion: v1
 kind: Namespace
@@ -28,7 +21,7 @@ spec:
     requests.memory: "40Gi"
     limits.cpu: "40"
     limits.memory: "80Gi"
-    services.loadbalancers: "1"   # FIX: enforce single LB (the ingress)
+    services.loadbalancers: "1"   # FIX: cap at 1 LB (the ingress)
 ---
 apiVersion: v1
 kind: LimitRange
@@ -47,9 +40,9 @@ spec:
 ---
 # -------------------------------------------------------
 # frontend
-# FIX: replicas 10→2 (HPA controls scaling)
-# FIX: requests right-sized 2Gi/1000m → 300Mi/150m
-# FIX: probes added, spot tolerations added
+# FIX: replicas 10→2 (HPA handles scaling)
+# FIX: requests 2Gi/1000m → 300Mi/150m
+# FIX: probes added, spot toleration added, no hardcoded secrets
 # -------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
@@ -57,7 +50,7 @@ metadata:
   name: frontend
   namespace: production
 spec:
-  replicas: 2   # FIX: HPA handles scaling from here
+  replicas: 2   # FIX: HPA scales from here
   selector:
     matchLabels:
       app: frontend
@@ -71,7 +64,6 @@ spec:
         operator: Equal
         value: "true"
         effect: NoSchedule
-
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
@@ -79,10 +71,9 @@ spec:
         labelSelector:
           matchLabels:
             app: frontend
-
       containers:
       - name: frontend
-        image: nginx:1.21   # swap for your image
+        image: nginx:1.21
         ports:
         - containerPort: 80
         resources:
@@ -96,9 +87,9 @@ spec:
         - name: DB_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: app-secrets   # FIX: no more hardcoded secrets
+              name: app-secrets   # FIX: no hardcoded secrets
               key: db-password
-        livenessProbe:            # FIX: probes were missing
+        livenessProbe:
           httpGet:
             path: /
             port: 80
@@ -117,7 +108,7 @@ metadata:
   name: frontend-service
   namespace: production
 spec:
-  type: ClusterIP   # FIX: was LoadBalancer ($18/mo) — ingress handles external traffic
+  type: ClusterIP   # FIX: was LoadBalancer ($18/mo) — ingress handles this
   selector:
     app: frontend
   ports:
@@ -148,7 +139,6 @@ spec:
         operator: Equal
         value: "true"
         effect: NoSchedule
-
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
@@ -156,10 +146,9 @@ spec:
         labelSelector:
           matchLabels:
             app: backend-api
-
       containers:
       - name: backend-api
-        image: nginx:1.21   # swap for your image
+        image: nginx:1.21
         ports:
         - containerPort: 8080
         resources:
@@ -203,8 +192,7 @@ spec:
 ---
 # -------------------------------------------------------
 # batch-worker — CronJob instead of always-on Deployment
-# FIX: was 4 replicas × 24/7 = ~$180/mo
-#      now: 0 cost when idle, runs only at 02:00
+# FIX: was 4 replicas × 24/7 idle; now runs only at 02:00
 # -------------------------------------------------------
 apiVersion: batch/v1
 kind: CronJob
@@ -231,8 +219,8 @@ spec:
             effect: NoSchedule
           containers:
           - name: batch-worker
-            image: busybox:1.35   # swap for your image
-            command: ["sh", "-c", "echo 'batch job running'; sleep 10"]
+            image: busybox:1.35
+            command: ["sh", "-c", "echo 'batch job done'; sleep 5"]
             resources:
               requests:
                 memory: "2Gi"
@@ -242,8 +230,8 @@ spec:
                 cpu: "2000m"
 ---
 # -------------------------------------------------------
-# HPA — fixed: minReplicas reduced so scale-down works
-# FIX: autoscaling/v2, dual CPU+memory metrics, scale-down policy
+# HPA — fixed: minReplicas allows actual scale-down
+# FIX: autoscaling/v2 with CPU+memory, scale-down policy
 # -------------------------------------------------------
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -255,7 +243,7 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: frontend
-  minReplicas: 2    # FIX: was 10 — now actually scales down
+  minReplicas: 2    # FIX: was 10 — now actually scales down at night
   maxReplicas: 20
   metrics:
   - type: Resource
@@ -304,9 +292,9 @@ spec:
       stabilizationWindowSeconds: 300
 ---
 # -------------------------------------------------------
-# Ingress — single entry point, replaces 3 LoadBalancers
-# FIX: was 3 × LoadBalancer services = $54/mo
-#      now 1 ingress controller = $18/mo
+# Ingress — one entry point replaces 3 LoadBalancers
+# FIX: was 3 × LoadBalancer = $54/mo → 1 ingress = $18/mo
+# (NGINX controller installed by 02-deploy-after.sh via helm)
 # -------------------------------------------------------
 apiVersion: networking.k8s.io/v1
 kind: Ingress

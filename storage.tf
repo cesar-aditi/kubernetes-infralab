@@ -9,17 +9,17 @@ resource "google_storage_bucket" "app_assets" {
   storage_class = "STANDARD"
   force_destroy = false
 
-  # FIX: version expiry — old versions don't accumulate forever
   versioning {
     enabled = true
   }
 
+  # FIX: expire old versions — stop accumulating forever
   lifecycle_rule {
     action { type = "Delete" }
     condition { num_newer_versions = 3 }
   }
 
-  # FIX: tiering — objects move to cheaper classes automatically
+  # FIX: tier to NEARLINE after 30 days
   lifecycle_rule {
     action {
       type          = "SetStorageClass"
@@ -28,6 +28,7 @@ resource "google_storage_bucket" "app_assets" {
     condition { age = 30 }
   }
 
+  # FIX: tier to COLDLINE after 90 days
   lifecycle_rule {
     action {
       type          = "SetStorageClass"
@@ -43,7 +44,6 @@ resource "google_storage_bucket" "app_logs" {
   storage_class = "STANDARD"
   force_destroy = false
 
-  # FIX: logs tier quickly — they're rarely accessed after 30 days
   lifecycle_rule {
     action {
       type          = "SetStorageClass"
@@ -70,7 +70,7 @@ resource "google_storage_bucket" "app_logs" {
 resource "google_storage_bucket" "backups" {
   name          = "${var.project_id}-backups"
   location      = var.region
-  storage_class = "NEARLINE"    # FIX: backups start on NEARLINE, not STANDARD
+  storage_class = "NEARLINE"    # FIX: backups start on NEARLINE (was STANDARD)
   force_destroy = false
 
   lifecycle_rule {
@@ -88,7 +88,7 @@ resource "google_storage_bucket" "backups" {
   }
 }
 
-# FIX: orphaned disks removed entirely
-# legacy-db-data-disk  (500 GB pd-ssd) — $85/mo gone
-# worker-vm-disk-1     (200 GB pd-ssd) — $34/mo gone
-# worker-vm-disk-2     (200 GB pd-ssd) — $34/mo gone
+# FIX: 3 orphaned disks removed
+# legacy-db-disk   500 GB pd-ssd  ~$85/mo  → gone
+# worker-disk-1    200 GB pd-ssd  ~$34/mo  → gone
+# worker-disk-2    200 GB pd-ssd  ~$34/mo  → gone

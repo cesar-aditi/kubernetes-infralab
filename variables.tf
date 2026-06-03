@@ -4,9 +4,9 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "GCP region — southamerica-east1 is closer to LATAM users than original us-east1"
+  description = "GCP region"
   type        = string
-  default     = "southamerica-east1"   # FIX: was us-east1
+  default     = "southamerica-east1"   # FIX: closer to LATAM (was us-east1)
 }
 
 variable "cluster_name" {
@@ -22,19 +22,19 @@ variable "environment" {
 }
 
 variable "authorized_cidr" {
-  description = "CIDR allowed to reach the GKE API server (your office/VPN IP)"
+  description = "CIDR allowed to reach the GKE API server"
   type        = string
-  default     = "0.0.0.0/0"   # Restrict to your IP in production
+  default     = "0.0.0.0/0"   # Restrict to your VPN/office IP in production
 }
 
 variable "spot_min_nodes" {
-  description = "Min nodes in spot pool per zone"
+  description = "Minimum nodes in spot pool per zone"
   type        = number
   default     = 1
 }
 
 variable "spot_max_nodes" {
-  description = "Max nodes in spot pool per zone"
+  description = "Maximum nodes in spot pool per zone"
   type        = number
   default     = 4
 }
