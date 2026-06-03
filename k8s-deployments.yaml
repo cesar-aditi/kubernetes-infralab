@@ -12,6 +12,16 @@ metadata:
   labels:
     cost-center: "production"          # FIX: cost center label for chargeback
     environment: "production"
+    # FIX: PodSecurity admission — enforce restricted standard in production.
+    # Blocks privileged containers, host namespaces, and unsafe capabilities.
+    # "warn" and "audit" also set so violations surface in logs even if not yet
+    # blocking (e.g. during a rollout).
+    pod-security.kubernetes.io/enforce: "restricted"
+    pod-security.kubernetes.io/enforce-version: "latest"
+    pod-security.kubernetes.io/warn: "restricted"
+    pod-security.kubernetes.io/warn-version: "latest"
+    pod-security.kubernetes.io/audit: "restricted"
+    pod-security.kubernetes.io/audit-version: "latest"
 ---
 apiVersion: v1
 kind: ResourceQuota

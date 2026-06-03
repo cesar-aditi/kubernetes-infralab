@@ -231,6 +231,12 @@ resource "google_container_cluster" "primary" {
     }
   }
 
+  # FIX: enroll cluster in Fleet so Policy Controller can be enabled via
+  # google_gke_hub_feature_membership below.
+  fleet {
+    project = var.project_id
+  }
+
   # FIX: VPA for right-sizing recommendations
   vertical_pod_autoscaling {
     enabled = true
@@ -406,4 +412,61 @@ resource "google_container_node_pool" "ondemand_critical" {
 resource "google_compute_address" "ingress_ip" {
   name   = "${var.cluster_name}-ingress-ip"
   region = var.region
+}
+
+# -------------------------------------------------------
+# GKE Hub Fleet Membership + Policy Controller
+# FIX: enables admission control via Policy Controller (required for
+#      NoUpdateServiceAccount ConstraintTemplate and PodSecurity enforcement)
+# -------------------------------------------------------
+
+# Register the cluster as a Fleet member (prerequisite for Policy Controller)
+resource "google_gke_hub_membership" "primary" {
+  provider      = google-beta
+  membership_id = "${var.cluster_name}-membership"
+  project       = var.project_id
+
+  endpoint {
+    gke_cluster {
+      resource_link = "//container.googleapis.com/${google_container_cluster.primary.id}"
+    }
+  }
+
+  depends_on = [google_container_cluster.primary]
+}
+
+# Enable the Policy Controller feature on the Fleet
+resource "google_gke_hub_feature" "policy_controller" {
+  provider = google-beta
+  name     = "policycontroller"
+  location = "global"
+  project  = var.project_id
+}
+
+# Bind Policy Controller configuration to the cluster membership
+resource "google_gke_hub_feature_membership" "policy_controller" {
+  provider   = google-beta
+  location   = "global"
+  feature    = google_gke_hub_feature.policy_controller.name
+  membership = google_gke_hub_membership.primary.membership_id
+  project    = var.project_id
+
+  policycontroller {
+    policy_controller_hub_config {
+      install_spec = "INSTALL_SPEC_ENABLED"
+
+      # Audit-only mode off — enforce in real time
+      exemptable_namespaces = ["kube-system"]
+
+      # Enforce PodSecurity admission standards via Policy Controller
+      monitoring {
+        backends = ["PROMETHEUS"]
+      }
+    }
+  }
+
+  depends_on = [
+    google_gke_hub_feature.policy_controller,
+    google_gke_hub_membership.primary,
+  ]
 }

@@ -1,0 +1,101 @@
+# kubectl apply -f k8s-policy-controller.yaml
+# Apply AFTER Policy Controller is running on the cluster
+# (google_gke_hub_feature_membership in main.tf provisions it via Fleet)
+#
+# FIX: NoUpdateServiceAccount — prevents Pods and workloads from modifying their
+# own ServiceAccount. Required by RBAC rule: "Restrict workloads from self-modifying
+# their own RBAC configuration". Policy Controller evaluates this constraint via the
+# admission webhook before resources are persisted.
+
+# -------------------------------------------------------
+# ConstraintTemplate — defines the NoUpdateServiceAccount rule
+# Uses Rego (OPA) to deny requests that update a Pod's serviceAccountName
+# -------------------------------------------------------
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: noupdateserviceaccount
+  annotations:
+    description: >-
+      Prevents workloads from modifying their own ServiceAccount reference.
+      Blocks self-modification of serviceAccountName in Pod specs submitted
+      by the pod's own ServiceAccount, preventing privilege escalation via
+      ServiceAccount swapping.
+spec:
+  crd:
+    spec:
+      names:
+        kind: NoUpdateServiceAccount
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            allowedGroups:
+              description: Groups exempt from this constraint (e.g. cluster-admin)
+              type: array
+              items:
+                type: string
+            allowedUsers:
+              description: Users exempt from this constraint
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package noupdateserviceaccount
+
+        violation[{"msg": msg}] {
+          # Only evaluate UPDATE operations on Pods
+          input.review.operation == "UPDATE"
+          input.review.kind.kind == "Pod"
+
+          old_sa := input.review.oldObject.spec.serviceAccountName
+          new_sa := input.review.object.spec.serviceAccountName
+
+          # Flag if serviceAccountName changed
+          old_sa != new_sa
+
+          # Allow if the requesting user is in the exemption list
+          not is_exempt_user
+          not is_exempt_group
+
+          msg := sprintf(
+            "Pods may not change their serviceAccountName. Attempted change: %v -> %v",
+            [old_sa, new_sa]
+          )
+        }
+
+        is_exempt_user {
+          input.review.userInfo.username == input.parameters.allowedUsers[_]
+        }
+
+        is_exempt_group {
+          input.review.userInfo.groups[_] == input.parameters.allowedGroups[_]
+        }
+---
+# -------------------------------------------------------
+# Constraint — applies NoUpdateServiceAccount to the production namespace.
+# Exempts system:masters (cluster management) per rule requirement:
+# "Cluster management system components must be explicitly excluded."
+# -------------------------------------------------------
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: NoUpdateServiceAccount
+metadata:
+  name: no-update-service-account-production
+  annotations:
+    description: >-
+      Prevents any Pod in the production namespace from modifying its own
+      ServiceAccount. Cluster management components (system:masters) are exempt.
+spec:
+  enforcementAction: deny
+  match:
+    namespaces:
+      - production
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    allowedUsers: []
+    allowedGroups:
+      - "system:masters"
