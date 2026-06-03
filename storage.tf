@@ -1,73 +1,94 @@
-# =======================================================
-# storage.tf — Cloud Storage and Persistent Disks
-# Provisioned over time, never cleaned up
-# =======================================================
+# -------------------------------------------------------
+# Storage — optimized
+# FIX: single-region, lifecycle tiering, orphaned disks removed
+# -------------------------------------------------------
 
-# --- Cloud Storage Buckets ---
-
-# Main app bucket — standard storage, no lifecycle rules
 resource "google_storage_bucket" "app_assets" {
-  name          = "my-company-prod-app-assets"
-  location      = "US"            # Multi-region — expensive, single-region would suffice
-  storage_class = "STANDARD"      # All objects on STANDARD — no tiering
+  name          = "${var.project_id}-app-assets"
+  location      = var.region    # FIX: single-region (was multi-region "US")
+  storage_class = "STANDARD"
+  force_destroy = false
 
-  # No lifecycle rules — objects accumulate forever
-  # lifecycle_rule {}  <-- never configured
-
-  # No versioning policy expiry
+  # FIX: version expiry — old versions don't accumulate forever
   versioning {
-    enabled = true    # Versioning on with no expiry = infinite old versions stored
+    enabled = true
   }
 
-  # No retention policy
-  # No object expiry
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition { num_newer_versions = 3 }
+  }
+
+  # FIX: tiering — objects move to cheaper classes automatically
+  lifecycle_rule {
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+    condition { age = 30 }
+  }
+
+  lifecycle_rule {
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+    condition { age = 90 }
+  }
 }
 
-# Log storage bucket — logs kept forever at standard pricing
 resource "google_storage_bucket" "app_logs" {
-  name          = "my-company-prod-logs"
-  location      = "US"
-  storage_class = "STANDARD"      # Logs should be NEARLINE or COLDLINE after 30 days
-
-  # Log data from 2021 still sitting here at $0.026/GB/month
-  # Estimated: 4TB of logs = ~$106/month just for old logs
-}
-
-# Backup bucket — no lifecycle, backups from 2021 still present
-resource "google_storage_bucket" "backups" {
-  name          = "my-company-prod-backups"
-  location      = "US"
+  name          = "${var.project_id}-app-logs"
+  location      = var.region    # FIX: single-region
   storage_class = "STANDARD"
+  force_destroy = false
 
-  # Daily backups for 3 years with no expiry
-  # Estimated 8TB sitting in STANDARD = ~$208/month
+  # FIX: logs tier quickly — they're rarely accessed after 30 days
+  lifecycle_rule {
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+    condition { age = 30 }
+  }
+
+  lifecycle_rule {
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+    condition { age = 90 }
+  }
+
+  # FIX: delete logs after 1 year
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition { age = 365 }
+  }
 }
 
-# --- Persistent Disk for legacy database (moved to Cloud SQL but disk kept) ---
-resource "google_compute_disk" "legacy_db_disk" {
-  name  = "legacy-db-data-disk"
-  type  = "pd-ssd"          # SSD — but this disk is no longer attached to any VM
-  size  = 500               # 500GB orphaned SSD disk = ~$85/month doing nothing
-  zone  = "us-east1-b"
+resource "google_storage_bucket" "backups" {
+  name          = "${var.project_id}-backups"
+  location      = var.region
+  storage_class = "NEARLINE"    # FIX: backups start on NEARLINE, not STANDARD
+  force_destroy = false
 
-  # No snapshot schedule
-  # No deletion protection
+  lifecycle_rule {
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+    condition { age = 90 }
+  }
+
+  # FIX: delete backups older than 1 year
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition { age = 365 }
+  }
 }
 
-# --- Additional orphaned disks from old VMs ---
-resource "google_compute_disk" "old_worker_disk_1" {
-  name  = "worker-vm-disk-01"   # VM was deleted but disk remains
-  type  = "pd-ssd"
-  size  = 200
-  zone  = "us-east1-b"
-}
-
-resource "google_compute_disk" "old_worker_disk_2" {
-  name  = "worker-vm-disk-02"
-  type  = "pd-ssd"
-  size  = 200
-  zone  = "us-east1-b"
-}
-
-# --- PersistentVolumeClaims in Kubernetes ---
-# Defined as YAML, representing GCP PDs provisioned by GKE
+# FIX: orphaned disks removed entirely
+# legacy-db-data-disk  (500 GB pd-ssd) — $85/mo gone
+# worker-vm-disk-1     (200 GB pd-ssd) — $34/mo gone
+# worker-vm-disk-2     (200 GB pd-ssd) — $34/mo gone
