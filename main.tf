@@ -44,12 +44,25 @@ resource "google_compute_subnetwork" "subnet" {
 
   secondary_ip_range {
     range_name    = "pods"
+    # /14 = 262,144 IPs. With /24 per node (~110 pods), supports ~1,024 nodes —
+    # well above spot_max (var.spot_max_nodes × 3 zones) + ondemand_max (3 × 3 zones).
     ip_cidr_range = "10.48.0.0/14"
   }
   secondary_ip_range {
     range_name    = "services"
     ip_cidr_range = "10.52.0.0/20"
   }
+}
+
+# FIX: dedicated subnet for internal load balancer Services
+# Keeps ILB traffic off the node subnet and enables separate security filtering.
+resource "google_compute_subnetwork" "ilb_subnet" {
+  name          = "${var.cluster_name}-ilb-subnet"
+  ip_cidr_range = "10.1.0.0/24"
+  region        = var.region
+  network       = google_compute_network.vpc.id
+  purpose       = "INTERNAL_HTTPS_LOAD_BALANCER"
+  role          = "ACTIVE"
 }
 
 # Cloud NAT — lets private nodes reach internet (pull images) without public IPs
@@ -65,6 +78,17 @@ resource "google_compute_router_nat" "nat" {
   region                             = var.region
   nat_ip_allocate_option             = "AUTO_ONLY"
   source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+
+  # FIX: dynamic port allocation — 64 min / 2048 max per endpoint
+  enable_dynamic_port_allocation = true
+  min_ports_per_vm               = 64
+  max_ports_per_vm               = 2048
+
+  # FIX: reduce TCP TIME_WAIT timeout 120s → 5s for high-connection-volume clusters
+  tcp_time_wait_timeout_sec = 5
+
+  # FIX: disable endpoint-independent mapping to prevent double-SNAT for pod traffic
+  enable_endpoint_independent_mapping = false
 }
 
 # -------------------------------------------------------
@@ -92,6 +116,44 @@ resource "google_project_iam_member" "node_sa_metrics_writer" {
   project = var.project_id
   role    = "roles/monitoring.metricWriter"
   member  = "serviceAccount:${google_service_account.gke_node_sa.email}"
+}
+
+# -------------------------------------------------------
+# Workload ServiceAccounts — one per workload (RBAC best practice)
+# Each workload gets its own SA so RBAC and audit logs are attributable.
+# -------------------------------------------------------
+resource "google_service_account" "frontend_sa" {
+  account_id   = "${var.cluster_name}-frontend"
+  display_name = "GKE Workload SA — frontend"
+}
+
+resource "google_service_account" "backend_api_sa" {
+  account_id   = "${var.cluster_name}-backend-api"
+  display_name = "GKE Workload SA — backend-api"
+}
+
+resource "google_service_account" "batch_worker_sa" {
+  account_id   = "${var.cluster_name}-batch-worker"
+  display_name = "GKE Workload SA — batch-worker"
+}
+
+# Bind each workload KSA → GSA for Workload Identity (allows impersonation)
+resource "google_service_account_iam_member" "frontend_wi" {
+  service_account_id = google_service_account.frontend_sa.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[production/frontend-sa]"
+}
+
+resource "google_service_account_iam_member" "backend_api_wi" {
+  service_account_id = google_service_account.backend_api_sa.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[production/backend-api-sa]"
+}
+
+resource "google_service_account_iam_member" "batch_worker_wi" {
+  service_account_id = google_service_account.batch_worker_sa.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[production/batch-worker-sa]"
 }
 
 # -------------------------------------------------------
@@ -136,6 +198,23 @@ resource "google_container_cluster" "primary" {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
 
+  # FIX: Dataplane V2 — eBPF-based network policy enforcement and observability
+  datapath_provider = "ADVANCED_DATAPATH"
+
+  # FIX: enable network policy enforcement at cluster level (Dataplane V2 handles enforcement,
+  # but the flag is still required to allow NetworkPolicy resources to take effect)
+  network_policy {
+    enabled  = true
+    provider = "CALICO"
+  }
+
+  # FIX: Cloud DNS for GKE — eliminates self-hosted kube-dns operational burden
+  dns_config {
+    cluster_dns        = "CLOUD_DNS"
+    cluster_dns_scope  = "CLUSTER_SCOPE"
+    cluster_dns_domain = "cluster.local"
+  }
+
   addons_config {
     horizontal_pod_autoscaling {
       disabled = false   # FIX: was disabled
@@ -144,6 +223,10 @@ resource "google_container_cluster" "primary" {
       disabled = false
     }
     gce_persistent_disk_csi_driver_config {
+      enabled = true
+    }
+    # FIX: NodeLocal DNSCache — reduces DNS latency by caching at each node
+    dns_cache_config {
       enabled = true
     }
   }
@@ -216,14 +299,20 @@ resource "google_container_node_pool" "spot_workload" {
   }
 
   node_config {
-    machine_type    = "e2-standard-4"                          # FIX: right-sized (was n1-standard-8)
-    spot            = true                                     # FIX: 60-91% cheaper
-    disk_size_gb    = 50                                       # FIX: was 200 GB
-    disk_type       = "pd-balanced"                            # FIX: was pd-ssd
-    service_account = google_service_account.gke_node_sa.email # FIX: least-privilege SA
+    machine_type    = "e2-standard-4"                           # FIX: right-sized (was n1-standard-8)
+    spot            = true                                      # FIX: 60-91% cheaper
+    disk_size_gb    = 50                                        # FIX: was 200 GB
+    disk_type       = "pd-balanced"                             # FIX: was pd-ssd
+    image_type      = "COS_CONTAINERD"                          # FIX: explicit COS — hardened for containers
+    service_account = google_service_account.gke_node_sa.email  # FIX: least-privilege SA
 
     workload_metadata_config {
       mode = "GKE_METADATA"
+    }
+
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
     }
 
     taint {
@@ -271,10 +360,16 @@ resource "google_container_node_pool" "ondemand_critical" {
     spot            = false
     disk_size_gb    = 50
     disk_type       = "pd-balanced"
+    image_type      = "COS_CONTAINERD"                          # FIX: explicit COS
     service_account = google_service_account.gke_node_sa.email
 
     workload_metadata_config {
       mode = "GKE_METADATA"
+    }
+
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
     }
 
     labels = {

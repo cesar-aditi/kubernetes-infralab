@@ -9,6 +9,9 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: production
+  labels:
+    cost-center: "production"          # FIX: cost center label for chargeback
+    environment: "production"
 ---
 apiVersion: v1
 kind: ResourceQuota
@@ -39,6 +42,152 @@ spec:
       memory: "512Mi"
 ---
 # -------------------------------------------------------
+# ServiceAccounts — one per workload (RBAC best practice)
+# FIX: was missing — all workloads defaulted to `default` SA
+# automountServiceAccountToken: false — none of these workloads
+# call the Kubernetes API, so mounting a token is unnecessary.
+# -------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frontend-sa
+  namespace: production
+  annotations:
+    iam.gke.io/gcp-service-account: REPLACE_WITH_PROJECT_ID-frontend@REPLACE_WITH_PROJECT_ID.iam.gserviceaccount.com
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backend-api-sa
+  namespace: production
+  annotations:
+    iam.gke.io/gcp-service-account: REPLACE_WITH_PROJECT_ID-backend-api@REPLACE_WITH_PROJECT_ID.iam.gserviceaccount.com
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: batch-worker-sa
+  namespace: production
+  annotations:
+    iam.gke.io/gcp-service-account: REPLACE_WITH_PROJECT_ID-batch-worker@REPLACE_WITH_PROJECT_ID.iam.gserviceaccount.com
+automountServiceAccountToken: false
+---
+# -------------------------------------------------------
+# NetworkPolicy — default deny all ingress and egress
+# FIX: was missing — pods had unrestricted inter-pod communication
+# -------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {}   # applies to all pods in namespace
+  policyTypes:
+  - Ingress
+  - Egress
+---
+# Allow frontend to receive traffic from the ingress controller
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-frontend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 80
+---
+# Allow backend-api to receive traffic from frontend and ingress controller
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-backend-api
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend-api
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+---
+# Allow all pods to reach kube-dns for name resolution (required with default-deny egress)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+# Allow frontend egress to backend-api
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend-egress
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: backend-api
+    ports:
+    - protocol: TCP
+      port: 8080
+---
+# Allow batch-worker outbound internet access (image pulls, external API calls)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-batch-worker-egress
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: batch-worker
+  policyTypes:
+  - Egress
+  egress:
+  - {}   # batch-worker may need unrestricted egress; tighten when destinations are known
+---
+# -------------------------------------------------------
 # frontend
 # FIX: replicas 10→2 (HPA handles scaling)
 # FIX: requests 2Gi/1000m → 300Mi/150m
@@ -59,6 +208,8 @@ spec:
       labels:
         app: frontend
     spec:
+      serviceAccountName: frontend-sa           # FIX: dedicated SA (not default)
+      automountServiceAccountToken: false        # FIX: no K8s API access needed
       tolerations:
       - key: "cloud.google.com/gke-spot"
         operator: Equal
@@ -114,6 +265,8 @@ spec:
   ports:
   - port: 80
     targetPort: 80
+  sessionAffinity: None           # FIX: explicit — None avoids sticky-session imbalance
+  # externalTrafficPolicy not set: ClusterIP Services do not handle external traffic
 ---
 # -------------------------------------------------------
 # backend-api
@@ -134,6 +287,8 @@ spec:
       labels:
         app: backend-api
     spec:
+      serviceAccountName: backend-api-sa        # FIX: dedicated SA
+      automountServiceAccountToken: false        # FIX: no K8s API access needed
       tolerations:
       - key: "cloud.google.com/gke-spot"
         operator: Equal
@@ -189,6 +344,8 @@ spec:
   ports:
   - port: 8080
     targetPort: 8080
+  sessionAffinity: None           # FIX: explicit — even distribution, no sticky sessions
+  # externalTrafficPolicy not set: ClusterIP Services do not handle external traffic
 ---
 # -------------------------------------------------------
 # batch-worker — CronJob instead of always-on Deployment
@@ -212,6 +369,8 @@ spec:
       template:
         spec:
           restartPolicy: OnFailure
+          serviceAccountName: batch-worker-sa   # FIX: dedicated SA
+          automountServiceAccountToken: false    # FIX: no K8s API access needed
           tolerations:
           - key: "cloud.google.com/gke-spot"
             operator: Equal
