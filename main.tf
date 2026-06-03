@@ -272,6 +272,18 @@ resource "google_container_cluster" "primary" {
     channel = "REGULAR"
   }
 
+  # FIX: explicitly disable legacy authentication — client certs and static passwords
+  # Enforced by org policy: constraints/container.managed.disableLegacyClientCertificateIssuance
+  master_auth {
+    client_certificate_config {
+      issue_client_certificate = false
+    }
+  }
+
+  # FIX: explicitly disable ABAC — all access control via IAM + RBAC only
+  # Enforced by org policy: constraints/container.managed.disableABAC
+  enable_legacy_abac = false
+
   lifecycle {
     ignore_changes = [initial_node_count]
   }

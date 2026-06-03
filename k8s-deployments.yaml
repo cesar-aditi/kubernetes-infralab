@@ -134,6 +134,19 @@ spec:
     - protocol: TCP
       port: 8080
 ---
+# FIX: NetworkLogging — enables Dataplane V2 network policy enforcement logging
+# Required by rule: "Network policy logging must be enabled for enforcement verification"
+apiVersion: networking.gke.io/v1alpha1
+kind: NetworkLogging
+metadata:
+  name: default
+spec:
+  cluster:
+    allow:
+      log: false     # only log denied traffic to avoid log volume on allowed flows
+    deny:
+      log: true
+---
 # Allow all pods to reach kube-dns for name resolution (required with default-deny egress)
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -215,6 +228,14 @@ spec:
         operator: Equal
         value: "true"
         effect: NoSchedule
+      # FIX: podAntiAffinity — hard rule prevents all frontend pods landing in the same zone
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: frontend
+            topologyKey: topology.kubernetes.io/zone
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
@@ -294,6 +315,14 @@ spec:
         operator: Equal
         value: "true"
         effect: NoSchedule
+      # FIX: podAntiAffinity — hard rule prevents all backend-api pods landing in the same zone
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: backend-api
+            topologyKey: topology.kubernetes.io/zone
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
