@@ -3,6 +3,11 @@ variable "project_id" {
   type        = string
 }
 
+variable "org_id" {
+  description = "GCP Organization ID — required for org policy enforcement"
+  type        = string
+}
+
 variable "region" {
   description = "GCP region"
   type        = string
